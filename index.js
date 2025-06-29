@@ -1,0 +1,358 @@
+const dotenv = require("dotenv");
+const express = require("express");
+const cors = require("cors");
+const admin = require("firebase-admin");
+const { MongoClient, ServerApiVersion, ObjectId } = require('mongodb');
+
+dotenv.config();
+
+const app = express();
+app.use(cors());
+app.use(express.json());
+
+const PORT = process.env.PORT || 3000;
+
+const uri = process.env.MONGO_URI;
+const stripe = require('stripe')(process.env.PAYMENT_GATEWAY_KEY);
+
+const client = new MongoClient(uri, {
+  serverApi: {
+    version: ServerApiVersion.v1,
+    strict: true,
+    deprecationErrors: true,
+  }
+});
+
+
+
+var serviceAccount = require("./firebase-admin-key.json");
+
+admin.initializeApp({
+  credential: admin.credential.cert(serviceAccount)
+});
+
+
+
+let paymentCollection;
+let parcelCollection;
+let usersCollection;
+let ridersCollection;
+
+async function run() {
+  try {
+    await client.connect();
+    parcelCollection = client.db("parcelDB").collection("parcels");
+    paymentCollection = client.db("parcelDB").collection("payments");
+    usersCollection = client.db("parcelDB").collection("users");
+    ridersCollection = client.db("parcelDB").collection("riders")
+
+
+
+    console.log("✅ Connected to MongoDB");
+
+  } catch (err) {
+    console.error("❌ MongoDB Connection Error:", err.message);
+  }
+}
+run().catch(console.dir);
+
+
+
+//custom middlewares
+const verifyFbToken = async (req, res, next) => {
+  const authHeader = req.headers.authorization;
+
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).send({ message: 'Unauthorized Access' });
+  }
+
+  const token = authHeader.split(' ')[1];
+  if (!token) {
+    return res.status(401).send({ message: 'Unauthorized Access' });
+  }
+
+  try {
+    const decoded = await admin.auth().verifyIdToken(token);
+    req.user = decoded; // Save user info for next middleware/route
+    next();
+  } catch (error) {
+    console.error('❌ Firebase Token verification failed:', error);
+    return res.status(403).send({ message: 'Forbidden' });
+  }
+
+}
+
+// parcels api
+
+
+app.get("/parcels", async (req, res) => {
+  try {
+    const userEmail = req.query.email;
+    if (!userEmail) {
+      return res.status(400).json({ error: "Email query parameter is required" });
+    }
+
+    const parcels = await parcelCollection
+      .find({ created_by: userEmail })
+      .sort({ creation_date: -1 }) // 🔽 Latest first
+      .toArray();
+
+    res.send(parcels);
+  } catch (err) {
+    console.error("❌ Error fetching parcels:", err.message);
+    res.status(500).json({ error: "Internal Server Error" });
+  }
+});
+
+app.get("/parcels/:id", async (req, res) => {
+  const id = req.params.id;
+
+  try {
+    const parcel = await parcelCollection.findOne({ _id: new ObjectId(id) });
+
+    if (!parcel) {
+      return res.status(404).json({ message: "Parcel not found" });
+    }
+
+    res.send(parcel);
+  } catch (error) {
+    console.error("Error fetching parcel by ID:", error);
+    res.status(500).json({ message: "Internal server error" });
+  }
+});
+
+// ✅ POST route - now correct!
+app.post("/parcels", async (req, res) => {
+  try {
+    const parcel = req.body;
+    const result = await parcelCollection.insertOne(parcel);
+    res.status(201).json({ message: "✅ Parcel added", insertedId: result.insertedId });
+  } catch (err) {
+    console.error("❌ Error inserting parcel:", err.message);
+    res.status(500).json({ error: "Internal Server Error" });
+  }
+});
+
+
+app.delete('/parcels/:id', async (req, res) => {
+  const id = req.params.id;
+  const result = await parcelCollection.deleteOne({ _id: new ObjectId(id) });
+  res.send(result);
+});
+
+app.post('/users', async (req, res) => {
+  const email = req.body.email;
+
+  if (!email) {
+    return res.status(400).send({ message: 'Email is required' });
+  }
+
+  const existingUser = await usersCollection.findOne({ email });
+
+  if (existingUser) {
+    // update last login time
+    return res.send({ message: 'User already exists', inserted: false });
+  }
+
+  // Add default role and timestamps
+  const user = req.body;
+
+  const result = await usersCollection.insertOne(user);
+  res.send({ message: 'New user created', insertedId: result.insertedId });
+});
+
+
+app.post('/tracking', async (req, res) => {
+  try {
+    const trackingUpdate = req.body; // { trackingId, status, timestamp, location }
+    const result = await trackingCollection.insertOne(trackingUpdate);
+    res.send(result);
+  } catch (error) {
+    console.error("POST /tracking error:", error);
+    res.status(500).send({ error: 'Failed to add tracking update' });
+  }
+});
+
+
+// payment related api
+app.get('/payments', verifyFbToken, async (req, res) => {
+  try {
+    const userEmail = req.query.email;
+    if (req.user.email !== userEmail) {
+      return res.status(403).send({ message: 'Forbidden' });
+    }
+
+
+    const query = userEmail ? { email: userEmail } : {};
+    const options = { sort: { paid_at: -1 } }; // Latest first
+    const payments = await paymentCollection.find(query, options).toArray();
+    res.send(payments);
+
+
+  } catch (error) {
+    console.error("Error in GET /payments:", error);
+    res.status(500).send({ error: 'Failed to load payment history' });
+  }
+});
+
+
+
+app.post('/payments', async (req, res) => {
+  const { parcelId, email, amount, paymentMethod, transactionId } = req.body;
+
+
+
+  const paymentDoc = {
+    transactionId,
+    email,
+    parcelId,
+    paymentMethod,
+    amount,
+    status: 'paid',
+    paid_at_string: new Date().toISOString(),
+    paid_at: new Date()
+  };
+
+  try {
+    // Save payment history
+    const paymentResult = await paymentCollection.insertOne(paymentDoc);
+
+    // Update parcel's payment status
+    const updateResult = await parcelCollection.updateOne(
+      { _id: new ObjectId(parcelId) },
+      { $set: { paymentStatus: 'paid' } }
+    );
+
+    res.send({
+      message: 'Payment recorded and parcel updated successfully',
+      insertedId: paymentResult.insertedId,
+      paymentResult,
+      updateResult
+    });
+
+  } catch (error) {
+    console.error('Error saving payment:', error);
+    res.status(500).send({ error: 'Payment failed to record' });
+  }
+});
+
+
+
+app.post('/create-payment-intent', async (req, res) => {
+  const amountInCents = req.body.amountInCents;
+  try {
+    const paymentIntent = await stripe.paymentIntents.create({
+      amount: 1000, // Amount in cents
+      currency: 'usd',
+      payment_method_types: ['card'],
+    });
+
+    res.json({ clientSecret: paymentIntent.client_secret });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// riders api
+app.get('/riders/pending', async (req, res) => {
+  try {
+    const riders = await ridersCollection.find({ status: "pending" }).toArray();
+    res.send(riders);
+  } catch (error) {
+    console.error("❌ Error fetching riders:", error);
+    res.status(500).send({ message: "Failed to fetch riders" });
+  }
+});
+
+
+// make admin api
+
+// GET /users/search?email=xyz
+app.get('/users/search', async (req, res) => {
+  const email = req.query.email;
+  if (!email) {
+    return res.status(400).send({ message: "missing email query" })
+  }
+  const regex = new RegExp(email, "i")
+  try {
+    const users = await usersCollection.find({ email: { $regex: regex } }).limit(10).toArray();
+    res.send(users);
+  }
+  catch (error) {
+    console.error("Error searching users", error);
+    res.status(500).send({ message: "Error searching users" });
+  }
+
+});
+
+// PUT /users/admin/:email
+app.put('/users/admin/:email', async (req, res) => {
+  const email = req.params.email;
+  const makeAdmin = req.body.isAdmin;
+
+  const result = await usersCollection.updateOne(
+    { email:email },
+    { $set: { role: makeAdmin ? "admin" : "user" } }
+  );
+
+  res.send(result);
+});
+
+
+app.post('/riders', async (req, res) => {
+  const rider = req.body;
+  const result = await ridersCollection.insertOne(rider)
+  res.send(result)
+})
+app.patch('/riders/:id/status', async (req, res) => {
+  const { id } = req.params;
+  const { status, email } = req.body;
+  console.log(id)
+  const result = await ridersCollection.updateOne(
+    { _id: new ObjectId(id) },
+    { $set: { status, approvedAt: new Date() } }
+  );
+
+  // update user status for accepting rider
+  if (status === "active") {
+    const userQuery = { email };
+    const userUpdatedDoc = {
+      $set: {
+        role: 'rider'
+      }
+    }
+    const roleResult = await usersCollection.updateOne(userQuery, userUpdatedDoc)
+    console.log(roleResult.modifiedCount)
+  }
+
+  res.send(result);
+});
+
+app.get('/riders/active', async (req, res) => {
+  try {
+    const riders = await ridersCollection.find({ status: 'active' }).toArray();
+    res.send(riders);
+  } catch (error) {
+    console.error("❌ Error fetching active riders:", error);
+    res.status(500).send({ message: "Failed to fetch active riders" });
+  }
+});
+
+
+app.delete('/riders/:id', async (req, res) => {
+  const id = req.params.id;
+  const result = await ridersCollection.deleteOne({ _id: new ObjectId(id) });
+  res.send(result);
+});
+
+
+// Default Route
+app.get("/", (req, res) => {
+  res.send("📦 Parcel Server Running...");
+});
+
+app.listen(PORT, () => {
+  console.log(`🚀 Server is running on port ${PORT}`);
+});
+
+
