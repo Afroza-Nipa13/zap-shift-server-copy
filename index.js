@@ -46,7 +46,7 @@ async function run() {
 
     // custom middleware
 
-    const verifyFbToken = async (req, res, next) => {
+  const verifyFbToken = async (req, res, next) => {
   const authHeader = req.headers.authorization;
 
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
