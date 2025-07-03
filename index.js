@@ -71,6 +71,7 @@ async function run() {
 
 const verifyAdminToken = async (req, res, next)=> {
   const email = req.user?.email;
+  console.log(email)
   const query ={ email};
   const user = await usersCollection.findOne(query);
   if(!user || user.role !== 'admin'){
@@ -81,35 +82,38 @@ const verifyAdminToken = async (req, res, next)=> {
 
     
 
-    app.get('/users/role/:email',verifyFbToken,verifyAdminToken, async (req, res) => {
-      
-      const email = req.params.email;
+    app.get('/users/role/:email', async (req, res) => {
+            try {
+                const email = req.params.email;
+                console.log(email)
+                if (!email) {
+                    return res.status(400).send({ message: 'Email is required' });
+                }
 
-      if (!email) {
-        return res.status(400).send({ message: 'Email is required' });
-      }
+                const user = await usersCollection.findOne({ email });
 
-      try {
-        const user = await usersCollection.findOne({ email });
+                if (!user) {
+                    return res.status(404).send({ message: 'User not found' });
+                }
 
-        if (!user) {
-          return res.status(404).send({ message: 'User not found' });
-        }
+                res.send({ role: user.role || 'user' });
+            } catch (error) {
+                console.error('Error getting user role:', error);
+                res.status(500).send({ message: 'Failed to get role' });
+            }
+        });
 
-        res.send({ role: user.role || 'user' }); // default to 'user' if role not set
-      } catch (error) {
-        console.error('Failed to fetch role:', error);
-        res.status(500).send({ message: 'Internal server error' });
-      }
-      
-    });
     
    app.get("/parcels", async (req, res) => {
   try {
-     const { email, paymentStatus, delivery_status } = req.query;
+     
+     const {email, paymentStatus, delivery_status}  = req.query;
+     
+    
     let query ={}
     if(email){
-      query= {created_by :email}
+      query= {created_by : email}
+     
     }
     if(paymentStatus){
       query.paymentStatus = paymentStatus
@@ -152,7 +156,25 @@ const verifyAdminToken = async (req, res, next)=> {
       }
     });
 
-    // ✅ POST route - now correct!
+  
+app.get('/rider/parcels',verifyFbToken, async (req, res) => {
+  try {
+    const email = req.user.email;
+    console.log(email)
+
+    const parcels = await parcelCollection.find({
+      assigned_rider_email: email,
+      delivery_status: { $in: ["rider_assigned", "in_transit"] }
+    }).toArray();
+
+    res.send(parcels);
+  } catch (error) {
+    console.error("❌ Failed to fetch rider parcels:", error);
+    res.status(500).send({ message: "Server error fetching rider parcels" });
+  }
+});
+
+    
     app.post("/parcels", async (req, res) => {
       try {
         const parcel = req.body;
@@ -164,9 +186,9 @@ const verifyAdminToken = async (req, res, next)=> {
       }
     });
 
-     app.patch("/parcels/:id/assign", async (req, res) => {
+    app.patch("/parcels/:id/assign",verifyFbToken,verifyAdminToken, async (req, res) => {
             const parcelId = req.params.id;
-            const { riderId, riderName } = req.body;
+            const { riderId, riderName,riderEmail } = req.body;
 
             try {
                 // Update parcel
@@ -174,9 +196,10 @@ const verifyAdminToken = async (req, res, next)=> {
                     { _id: new ObjectId(parcelId) },
                     {
                         $set: {
-                            delivery_status: "in_transit",
+                            delivery_status: "rider_assigned",
                             assigned_rider_id: riderId,
                             assigned_rider_name: riderName,
+                            assigned_rider_email:riderEmail
                         },
                     }
                 );
@@ -198,6 +221,32 @@ const verifyAdminToken = async (req, res, next)=> {
             }
         });
 
+   app.patch("/parcels/:id/status", async (req, res) => {
+            const parcelId = req.params.id;
+            const { status } = req.body;
+            const updatedDoc = {
+                delivery_status: status
+            }
+
+            if (status === 'in_transit') {
+                updatedDoc.picked_at = new Date().toISOString()
+            }
+            else if (status === 'delivered') {
+                updatedDoc.delivered_at = new Date().toISOString()
+            }
+
+            try {
+                const result = await parcelsCollection.updateOne(
+                    { _id: new ObjectId(parcelId) },
+                    {
+                        $set: updatedDoc
+                    }
+                );
+                res.send(result);
+            } catch (error) {
+                res.status(500).send({ message: "Failed to update status" });
+            }
+        });      
 
     app.delete('/parcels/:id', async (req, res) => {
       const id = req.params.id;
@@ -363,6 +412,15 @@ const verifyAdminToken = async (req, res, next)=> {
       res.send(result);
     });
 
+    app.get('/riders', async (req, res) => {
+  try {
+    const riders = await ridersCollection.find().toArray();
+    res.send(riders);
+  } catch (error) {
+    console.error("❌ Error fetching all riders:", error);
+    res.status(500).send({ message: "Failed to fetch riders" });
+  }
+});
 
     app.post('/riders', async (req, res) => {
       const rider = req.body;
@@ -404,11 +462,12 @@ const verifyAdminToken = async (req, res, next)=> {
     });
     app.get("/riders/available", async (req, res) => {
             const { district } = req.query;
+            console.log(district)
 
             try {
                 const riders = await ridersCollection
                     .find({
-                        district,
+                        sender_center:district,
                         // status: { $in: ["approved", "active"] },
                         // work_status: "available",
                     })
